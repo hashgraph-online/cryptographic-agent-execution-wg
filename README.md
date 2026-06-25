@@ -2,6 +2,7 @@
 The goal of this repository is to 
 # Main Components
 - Zk Firewall Sandbox
+  - Support for multiple Sanboxes (MultiPass, 
 - Threshold Decryption
 
 ## ZK Firewall 
