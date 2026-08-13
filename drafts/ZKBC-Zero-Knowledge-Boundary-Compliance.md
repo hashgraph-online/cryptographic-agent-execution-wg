@@ -1,6 +1,6 @@
 ---
 title: "HCS-XX — Zero-Knowledge Boundary Compliance"
-description: "A vendor-neutral architecture in which a non-bypassable gateway emits zero-knowledge proofs that an autonomous agent's boundary actions satisfy an issuer-defined policy, verifiable without revealing the underlying records, with receipts anchored to Hedera Consensus Service topics."
+description: "A vendor-neutral architecture in which a non-bypassable gateway emits zero-knowledge proofs that an autonomous agent's boundary actions satisfy an issuer-defined policy, verifiable without revealing the underlying records."
 sidebar_position: 999
 ---
 
@@ -84,13 +84,7 @@ inference.
 This memo defines the roles, the mediation invariant, the primitive and
 commitment constructions, three policy families, the proof-system requirements,
 the audit-record (journal) format and its wire encodings, the proof modes, and
-the security properties a conforming deployment MUST provide. Compliance
-receipts are anchored to Hedera Consensus Service (HCS) topics: a
-[Topic System](#topic-system) gives every receipt a consensus timestamp and a
-tamper-evident position in a public, append-only audit trail, and an
-[Operation Reference](#operation-reference) defines the `p`/`op` messages that
-publish receipts, policy commitments, and verifying-key registrations,
-following the conventions shared by HCS-2, HCS-10, and HCS-19.
+the security properties a conforming deployment MUST provide. 
 
 ## Motivation
 
@@ -100,7 +94,9 @@ enforce policy locally but produce no externally verifiable evidence. Plain logs
 provide evidence but expose the very records that policy is meant to protect.
 ZKBC resolves this tension by targeting the *boundary*: compliance is evaluated
 over the externally consequential actions an agent produces, and the evidence of
-that evaluation is a zero-knowledge proof — verifiable and confidential at once.
+that evaluation is a zero-knowledge proof. The resulting artifact is both 
+verifiable and confidential. In order to maintain confidentiality of the process
+it is recommended that the user maintain their own hardware for the gateway.
 
 - **Verifiable Compliance** – Any authorized auditor can check that an agent's
   released actions satisfied an issuer-defined policy, against a known, public
@@ -111,14 +107,14 @@ that evaluation is a zero-knowledge proof — verifiable and confidential at onc
 - **Non-Bypassable Enforcement** – The host confines the agent workload to a
   sandbox whose every egress channel passes through a gateway, so batch and
   recursive proofs can attest that no action was silently omitted from the
-  covered range.
+  covered range. This is achievable through a trusted hardware environment,
+  attestation of the software version via a TEE or a TPM.
 - **On-Graph Anchoring** – Publishing receipts to HCS topics gives each one an
   independent consensus timestamp, a tamper-evident running hash, and a
   discoverable location, without adding any trusted intermediary.
-- **Regulatory Alignment** – Complements [HCS-19](#references): where HCS-19
-  documents an agent's privacy activities (consent, processing, rights, audits),
-  ZKBC supplies the cryptographic proof layer that the documented enforcement
-  actually held, record by record.
+- **Regulatory Alignment** – Where required (i.e. in the EU AI Act) an additional 
+  method of gathering logs for storage should be implemented, but is outside of the
+  scope of this specification.
 
 ## Specification
 
@@ -990,15 +986,6 @@ deployment (SHA-384 and arithmetization-friendly sponges are both permitted
 profiles); and because the post-quantum posture of a ZKBC deployment rests on
 the transparency of the proof system, not on the commitment hash's output
 length. This is a documented deviation under the HCS-4 conventions.
-
-**On-graph anchoring.** Receipts are anchored to HCS topics rather than served
-only from gateway endpoints because consensus gives each receipt three
-properties no self-hosted log can offer: an independent, third-party timestamp;
-a tamper-evident position in the topic's running hash; and discoverability
-through the agent's profile rather than through the party being audited. The
-topic and operation conventions (memo grammar, `p`/`op` fields, enum tables)
-follow HCS-4 so that existing HCS-2/HCS-10/HCS-19 tooling can index ZKBC
-traffic without special cases.
 
 ### Deployment Profiles (Informative)
 
