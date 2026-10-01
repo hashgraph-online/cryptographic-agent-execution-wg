@@ -59,7 +59,11 @@ Discussion: (URL to GitHub Discussion)
 
 ## Authors
 
-- <name> (<github handle>)
+- Renee Davis (renee@openmatter.network)
+- michael@hol.org
+- patches@hol.org
+- scott@rubric-protocol.com
+- andrew@veraanchor.com
 
 ## Abstract
 
