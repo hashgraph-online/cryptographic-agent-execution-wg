@@ -60,6 +60,8 @@ Discussion: (URL to GitHub Discussion)
 ## Authors
 
 - Renee Davis (renee@openmatter.network)
+- Ada Anderson
+- Chris Biele
 - michael@hol.org
 - patches@hol.org
 - scott@rubric-protocol.com
