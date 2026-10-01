@@ -115,17 +115,17 @@ flowchart TB
   GWt <-->|"invocation / result"| Tools
   GWw <-->|"request / response"| Web
 
-  Gateways -->|"receipt_issued — journal inline, proof_ref, vk_id"| RT
+  Gateways -->|"receipt_issued — journal inline, proof_ref"| RT
   Gateways -->|"store deterministic-CBOR receipt"| F1
   Issuer -->|"policy_published · policy_revoked"| PR
   Issuer -->|"program_registered"| GR
-  Issuer -->|"store verifying key — vk_ref"| F1
+  Issuer -->|"store verifying key — vk_ref, where the proof system has one"| F1
   Issuer -.->|"distributes policy content — off-graph, confidential"| Gateways
 
   P11 -.->|"discover authentic topic ids"| Auditor
   RT -->|"read journals, verdicts, sequence_ranges"| Auditor
   PR -->|"resolve policy_id at consensus timestamp"| Auditor
-  GR -->|"resolve vk_id → program_id, proof_system"| Auditor
+  GR -->|"resolve program_id → proof_system, params, vk_id if any"| Auditor
   F1 -->|"fetch receipt · verifying key"| Auditor
 ```
 
@@ -327,10 +327,12 @@ flowchart LR
 
 [Implementation Workflow](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#implementation-workflow)
 Steps 1 and 2. Everything here happens once per deployment or per policy
-version, before any boundary action is mediated. `program_id` is
-`commit(nfc("program"), program_descriptor)`; `vk_id` MUST be
-`commit(nfc("vk"), vk_bytes)` over the bytes at the REQUIRED `vk_ref`, so a
-fetched key is self-authenticating.
+version, before any boundary action is mediated. `program_id` is the
+proof-system-native identifier of the compiled program (a zkVM image id, or
+`commit(nfc("vk"), vk_bytes)` for a circuit-specific SNARK); `vk_id` and
+`vk_ref` appear only when the proof system's verifier takes key material, and
+then `vk_id` MUST be `commit(nfc("vk"), vk_bytes)` over the bytes at `vk_ref`,
+so a fetched key is self-authenticating.
 
 ```mermaid
 sequenceDiagram
@@ -350,11 +352,13 @@ sequenceDiagram
   Gateway->>P11: add zkbc block (receipt_topic_ids, policy registry, program registry topic ids, proof_systems)
 
   Note over Issuer,F1: Step 2 — Program and policy registration
-  Issuer->>Issuer: compile compliance program · program_id = commit("program", descriptor)
-  Issuer->>F1: store verifying-key bytes
-  F1-->>Issuer: vk_ref = hcs://1/topicId
-  Issuer->>Issuer: vk_id = commit("vk", vk_bytes)
-  Issuer->>GR: program_registered {program_id, vk_id, proof_system, vk_ref, params?}
+  Issuer->>Issuer: compile compliance program · program_id = proof-system-native identifier (e.g. zkVM image id)
+  opt proof system's verifier takes key material
+    Issuer->>F1: store verifying-key bytes
+    F1-->>Issuer: vk_ref = hcs://1/topicId
+    Issuer->>Issuer: vk_id = commit("vk", vk_bytes)
+  end
+  Issuer->>GR: program_registered {program_id, proof_system, params?, vk_id?, vk_ref?}
   Issuer->>Issuer: set_commit forbidden F · allowlist A · sensitive keys K · commit canonicalization descriptor · access descriptor
   Issuer->>PR: policy_published {policy_id, policy_commitments, program_id, program_registry_topic_id, effective_from}
   Issuer-->>Gateway: distribute policy content off-graph (confidential)
@@ -387,14 +391,14 @@ flowchart TB
   Rel1["Release action to the external party"]
   Rel2["Release action to the external party"]
 
-  Wit["Phase 2 — build private witness<br/>action records · policy sets · Merkle openings · identities"]
+  Wit["Phase 2 — build private witness<br/>action records · policy sets · identities"]
   Stmt["Assemble public statement → statement_hash"]
   Prove["Generate zero-knowledge proof<br/>binds action · policy version · session · sequence_range"]
   Defect["Gateway defect<br/>MUST NOT publish the range · SHOULD alert<br/>gap visible to auditors"]
   Hold["HOLD — fail-closed<br/>signal prover_unavailable, distinct from policy_rejected<br/>MUST NOT release · sequence_no retained"]
-  Rcpt["Assemble receipt — deterministic CBOR<br/>journal + proof {system, params, bytes, vk_id}"]
+  Rcpt["Assemble receipt — deterministic CBOR<br/>journal + proof {system, params, bytes, vk_id if any}"]
   Store["Store receipt as HCS-1 file → proof_ref"]
-  Pub["Publish receipt_issued to receipt topic<br/>journal inline · proof_ref · vk_id · txn memo hcs-xx:op:0:0"]
+  Pub["Publish receipt_issued to receipt topic<br/>journal inline · proof_ref · txn memo hcs-xx:op:0:0"]
 
   In --> Cap --> Canon --> Pre
   Pre -->|"no"| Rej --> Regen --> In
@@ -443,7 +447,7 @@ sequenceDiagram
     Ext-->>Gateway: result (captured as the inbound action)
     Gateway->>F1: store CBOR receipt (journal + proof)
     F1-->>Gateway: proof_ref = hcs://1/topicId
-    Gateway->>RT: receipt_issued {journal (mode = real_time, sequence_range = {n, n}), proof_ref, vk_id}
+    Gateway->>RT: receipt_issued {journal (mode = real_time, sequence_range = {n, n}), proof_ref}
     Gateway-->>Agent: result delivered
   end
 ```
@@ -483,7 +487,7 @@ sequenceDiagram
   else proof ready
     Gateway->>F1: store CBOR receipt
     F1-->>Gateway: proof_ref
-    Gateway->>RT: receipt_issued {journal (mode = batch, sequence_range = {from, to}), proof_ref, vk_id}
+    Gateway->>RT: receipt_issued {journal (mode = batch, sequence_range = {from, to}), proof_ref}
   end
 ```
 
@@ -565,8 +569,9 @@ The hash constructions of
 and [Notation and Primitives](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#notation-and-primitives).
 Every variable-length field is length-prefixed (`LP(x) = uint64be(len(x)) ‖ x`)
 and every commitment is domain-separated by `PROTOCOL_LABEL = nfc("ZKBC/v1")`
-and a purpose tag. Merkle leaves and nodes carry `0x00` / `0x01` prefixes
-(RFC 6962 §2.1).
+and a purpose tag. A set commitment is one hash over the whole canonical set,
+with the element count prefixed; no tree and no opening format is defined, and
+the compliance program recomputes the commitment over the witness set.
 
 ```mermaid
 flowchart TB
@@ -574,20 +579,19 @@ flowchart TB
     SC["commit(tag, m) = H( LP(PROTOCOL_LABEL) ‖ LP(tag) ‖ LP(m) )"]
   end
 
-  subgraph SetC["Set commitment — binary Merkle root"]
+  subgraph SetC["Set commitment — one hash over the canonical set"]
     direction TB
     E["elements e_1..e_n<br/>canonical form · ascending byte order · deduplicated"]
-    L["leaf(tag, e) = H( byte(0x00) ‖ LP(PROTOCOL_LABEL) ‖ LP(tag) ‖ LP(e) )"]
-    Pad["pad with leaf(tag, empty) to next power of two<br/>empty set commits to leaf(tag, empty)"]
-    N["node(l, r) = H( byte(0x01) ‖ l ‖ r )<br/>fold pairwise left-to-right"]
-    Root["32-byte root = set_commit(tag, set)"]
-    E --> L --> Pad --> N --> Root
+    Cnt["uint64be(n) — element count · n = 0 for the empty set"]
+    Root["set_commit(tag, S) = H( LP(PROTOCOL_LABEL) ‖ LP(tag) ‖ uint64be(n) ‖ LP(e_1) ‖ … ‖ LP(e_n) )"]
+    Rec["in-circuit: recompute over the witness set, require equality with the public commitment,<br/>then test membership or non-membership directly"]
+    E --> Cnt --> Root --> Rec
   end
 
   subgraph Ids["Identifiers"]
     direction TB
-    PID["program_id = commit( nfc(program), program_descriptor )"]
-    VK["vk_id = commit( nfc(vk), vk_bytes )  — REQUIRED<br/>auditor recomputes over fetched bytes, rejects on mismatch"]
+    PID["program_id = proof-system-native program identifier<br/>zkVM image id · or commit( nfc(vk), vk_bytes ) for a circuit-specific SNARK<br/>the verifier checks the proof against it directly"]
+    VK["vk_id = commit( nfc(vk), vk_bytes )  — present iff the verifier takes key material<br/>auditor recomputes over fetched bytes, rejects on mismatch"]
     IDD["identity_digest = H( LP(PROTOCOL_LABEL) ‖ LP(nfc(identity)) ‖ LP(tenant_id) ‖ LP(user_id) )"]
     SID["session_id — opaque · RECOMMENDED 16 random bytes"]
     POL["policy_id — human-readable issuer-scoped label, non-secret"]
@@ -603,7 +607,7 @@ flowchart TB
     T6["arg → sanitized argument value (hash form)"]
   end
 
-  SC --> PID
+  SC -.->|"circuit-specific SNARK"| PID
   SC --> VK
   SC --> T4
   SC --> T5
@@ -621,7 +625,7 @@ result is both the journal's `statement_hash` and the proof's public input. Any
 edit to a bound journal field changes the hash and breaks verification. Three
 journal fields are *not* in the preimage — `issued_at` (advisory; consensus
 timestamp is authoritative), `proof_system` (bound indirectly through
-`vk_id → program_registered`), and `chain_digest` (derived from
+`program_id → program_registered`), and `chain_digest` (derived from
 `statement_hash`, so binding it would be circular) — see
 [R-12](./ZKBC-Architecture-Review.md#r-12) and
 [R-16](./ZKBC-Architecture-Review.md#r-16).
@@ -652,7 +656,7 @@ flowchart TB
   Cmp -->|"equal"| Ok
   Cmp -->|"mismatch"| Rej
 
-  Unb["Journal fields NOT in the preimage<br/>issued_at — advisory, consensus timestamp is authoritative<br/>proof_system — fixed by vk_id → program_registered<br/>chain_digest — derived from prev_chain_digest and statement_hash, recomputed by the verifier"]
+  Unb["Journal fields NOT in the preimage<br/>issued_at — advisory, consensus timestamp is authoritative<br/>proof_system — fixed by program_id → program_registered<br/>chain_digest — derived from prev_chain_digest and statement_hash, recomputed by the verifier"]
   Unb -.- P
 
   classDef unbound stroke-dasharray: 5 5;
@@ -699,12 +703,12 @@ flowchart TB
     R3{"proof_ref resolves to a valid HCS-1 file whose journal equals the inline journal?"}
     R4{"verdict = compliant?"}
     R5{"sequence_range has 1 ≤ from ≤ to, and from = to when mode = real_time?<br/>family non-empty, no duplicates, in order output · tool · access?"}
-    R6{"vk_id has a program_registered entry with matching program_id, proof_system, and params?"}
-    R7{"vk_ref resolves, and commit(vk, fetched bytes) equals vk_id?"}
+    R6{"journal.program_id has a program_registered entry with matching proof_system and params?"}
+    R7{"vk_id absent on both sides, or equal on both sides with vk_ref resolving and commit(vk, fetched bytes) equal to vk_id?"}
     R8{"a policy_published for policy_id is in effect at the consensus timestamp<br/>(max(consensus_ts, effective_from) ≤ t_r, not revoked)<br/>and its policy_commitments and program_id match?"}
     R9{"family includes output ⇒ output.canonicalization present?"}
     R10{"verifier reproduces the pinned Unicode version, normalization forms, and tokenizer?"}
-    R11{"proof verifies against the reconstructed public statement?"}
+    R11{"proof verifies against the reconstructed public statement<br/>under the verifier for proof_system, parameterized by program_id, params, and any registered key?"}
     R12{"mode = recursive ⇒ chain_digest recomputes, and prev_chain_digest is empty at genesis<br/>or equals chain_digest of the preceding recursive receipt, same topic and session?"}
     X1["REJECT"]
     X2["REJECT"]
@@ -804,12 +808,11 @@ flowchart LR
   subgraph W["Private witness — never leaves the gateway"]
     direction TB
     w1["raw output text"]
-    w2["forbidden set F — fold-normalized"]
-    w3["Merkle non-membership openings for every token"]
+    w2["forbidden set F — fold-normalized, the whole set"]
   end
 
   subgraph Rl["Relation proved in zero knowledge"]
-    r1["canonicalize output → token multiset M<br/>for every t in M: t is NOT a member of F"]
+    r1["set_commit(policy/output/forbidden, F) = policy_commitments.output.forbidden<br/>canonicalize output → token multiset M<br/>for every t in M: t is NOT a member of F"]
   end
 
   subgraph Pub["Public statement — in the journal"]
@@ -822,7 +825,7 @@ flowchart LR
 
   W --> Rl --> Pub
   classDef witness stroke-dasharray: 5 5;
-  class w1,w2,w3 witness;
+  class w1,w2 witness;
 ```
 
 ### C2. Tool-invocation family I/O
@@ -841,11 +844,11 @@ flowchart LR
     w2["allowlist A — nfc-normalized"]
     w3["sensitive-key set K — nfc-normalized, RFC 6901 paths"]
     w4["sanitization outcomes per sensitive key"]
-    w5["Merkle membership openings"]
   end
 
   subgraph Rl["Relations proved in zero knowledge"]
     direction TB
+    r0["set_commit(A) and set_commit(K) recomputed over the witness sets equal the public commitments"]
     r1["Authorization: nfc(tool id) is a member of A"]
     r2["Sanitization: for every argument key path in K,<br/>the value crosses the boundary only as<br/>mask → policy sentinel · redact → key omitted · hash → commit(nfc(arg), value)"]
   end
@@ -865,7 +868,7 @@ flowchart LR
   W --> Rl --> Pub
   Rl --> Out
   classDef witness stroke-dasharray: 5 5;
-  class w1,w2,w3,w4,w5 witness;
+  class w1,w2,w3,w4 witness;
 ```
 
 ### C3. Access family I/O
@@ -952,7 +955,7 @@ classDiagram
     +system string MUST equal journal.proof_system
     +params string OPTIONAL MUST equal program_registered.params
     +bytes base64url opaque proof
-    +vk_id base64url32
+    +vk_id base64url32 OPTIONAL present iff program_registered carries one
   }
   class Counts {
     +output token_count distinct_token_count hit_count
@@ -990,7 +993,7 @@ classDiagram
     +account_id string gateway
     +journal Journal inline
     +proof_ref string HRL hcs://1/topicId
-    +vk_id base64url32 MUST equal receipt.proof.vk_id
+    +vk_id base64url32 OPTIONAL present iff receipt.proof.vk_id is and equal to it
     +m string OPTIONAL memo
   }
   class policy_published {
@@ -1019,11 +1022,11 @@ classDiagram
     +p string hcs-xx
     +op string program_registered
     +account_id string issuer
-    +program_id base64url32
-    +vk_id base64url32 commits to bytes at vk_ref
+    +program_id base64url32 proof-system-native identifier
     +proof_system string
     +params string OPTIONAL
-    +vk_ref string HRL REQUIRED
+    +vk_id base64url32 REQUIRED iff the verifier takes key material · commits to bytes at vk_ref
+    +vk_ref string HRL REQUIRED iff vk_id
     +m string OPTIONAL
   }
   class ReceiptTopic {
@@ -1039,7 +1042,7 @@ classDiagram
   PolicyRegistry <.. policy_published : published by issuer
   PolicyRegistry <.. policy_revoked : published by issuer
   ProgramRegistry <.. program_registered : published by issuer
-  receipt_issued ..> program_registered : vk_id resolves to program_id
+  receipt_issued ..> program_registered : journal.program_id resolves to proof_system
   receipt_issued ..> policy_published : policy_id resolves at consensus timestamp
   policy_published ..> ProgramRegistry : program_registry_topic_id
 ```

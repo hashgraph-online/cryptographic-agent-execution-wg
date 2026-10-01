@@ -57,25 +57,15 @@ def commit(tag: bytes, m: bytes) -> bytes:
     return H(LP(PROTOCOL_LABEL) + LP(tag) + LP(m))
 
 
-def leaf(tag: bytes, e: bytes) -> bytes:
-    return H(b"\x00" + LP(PROTOCOL_LABEL) + LP(tag) + LP(e))
-
-
-def node(l: bytes, r: bytes) -> bytes:
-    return H(b"\x01" + l + r)
-
-
 def set_commit(tag: str, elements) -> bytes:
-    t = nfc(tag)
-    leaves = [leaf(t, e) for e in sorted(set(elements))]
-    size = 1
-    while size < max(len(leaves), 1):
-        size *= 2
-    leaves += [leaf(t, b"")] * (size - len(leaves))
-    while len(leaves) > 1:
-        leaves = [node(leaves[i], leaves[i + 1])
-                  for i in range(0, len(leaves), 2)]
-    return leaves[0]
+    # One hash over the whole canonical set: sorted, deduplicated, element
+    # count prefixed, every element length-prefixed. No tree, no openings;
+    # the compliance program recomputes this over the witness set.
+    canonical = sorted(set(elements))
+    pre = LP(PROTOCOL_LABEL) + LP(nfc(tag)) + uint64be(len(canonical))
+    for e in canonical:
+        pre += LP(e)
+    return H(pre)
 
 
 def identity_digest(tenant_id: bytes, user_id: bytes) -> bytes:
@@ -116,7 +106,11 @@ def chain_digest(prev: bytes, stmt_hash: bytes) -> bytes:
 
 
 def main():
-    program_id = commit(nfc("program"), nfc("zkbc.output.v1"))
+    # program_id is the proof-system-native program identifier (for a zkVM,
+    # the image id of the guest program). These are example bytes; nothing in
+    # this document derives them.
+    program_id = bytes.fromhex(
+        "7a6b5c4d3e2f10010203040506070809a0b1c2d3e4f5061728394a5b6c7d8e9f")
     forbidden = set_commit("policy/output/forbidden",
                            [fold(x) for x in ("credit_card", "ssn")])
     allowlist = set_commit("policy/tool/allowlist",
@@ -146,13 +140,14 @@ def main():
     stmt_rec1 = statement_hash(mode="recursive", sequence_range=(4, 5),
                                prev_chain=chain0, **common)
     chain1 = chain_digest(chain0, stmt_rec1)
-    # Example verifying-key bytes: 0x00..0x1f. A real key is the proof system's
-    # own serialization; only its bytes enter the commitment.
+    # Example verifying-key bytes: 0x00..0x1f, for a proof system whose
+    # verifier takes key material beyond program_id. A real key is the proof
+    # system's own serialization; only its bytes enter the commitment.
     vk_bytes = bytes(range(32))
     vk_id = commit(nfc("vk"), vk_bytes)
 
     rows = [
-        ('program_id (commit "program")', program_id),
+        ("program_id (base64url of the bytes above)", program_id),
         ('set_commit "policy/output/forbidden" (F)', forbidden),
         ('set_commit "policy/tool/allowlist" (A)', allowlist),
         ('set_commit "policy/tool/sensitive-keys" (K)', sensitive),
@@ -165,7 +160,7 @@ def main():
         ("chain_digest   (recursive #0, genesis)", chain0),
         ("statement_hash (recursive #1, 4..5)", stmt_rec1),
         ("chain_digest   (recursive #1)", chain1),
-        ('vk_id (commit "vk" over vk_bytes)', vk_id),
+        ('vk_id (commit "vk" over vk_bytes; when present)', vk_id),
     ]
     for label, value in rows:
         print(f"{label:<52}= {b64u(value)}")

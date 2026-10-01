@@ -22,7 +22,11 @@ proposal. R-15 and R-16 were found while applying the earlier resolutions —
 R-15 while specifying fail-closed `real_time` proving, R-16 while writing a
 recursive-mode test vector — and are recorded here with their fixes. Two
 resolutions below are superseded in part by R-15: `sequence_range` is now
-REQUIRED in every mode, not only `batch` and `recursive`.
+REQUIRED in every mode, not only `batch` and `recursive`. R-17 to R-19 were
+raised by working-group review on 2026-10-01 against the revised draft and
+are resolved in the revision that follows it; R-17 supersedes the `vk_id`
+item noted below the summary table, and R-18 supersedes the set-commitment
+bullet under *Sound as specified*.
 
 Severity scale:
 
@@ -53,13 +57,18 @@ Severity scale:
 | [R-14](#r-14) | Low | Resolved | Recursive mode | Publication cadence (every step vs. window end) is unspecified, yet the chain-link rule assumes preceding receipts exist on-topic. |
 | [R-15](#r-15) | High | Resolved | Coverage / real-time mode | `real_time` receipts carry no `sequence_range` but consume numbers from the shared session counter, so mixed-mode sessions can never tile and `real_time` sessions have no coverage claim. |
 | [R-16](#r-16) | High | Resolved | Statement binding / recursive mode | `statement_preimage` binds `chain_digest`, but `chain_digest` is computed from `statement_hash`: the definition is circular and recursive mode cannot be implemented as written. |
+| [R-17](#r-17) | High | Resolved | Program identity | `program_id` is an opaque registry label and the executed program is bound only through `vk_id`; for a zkVM the verifier is universal and the program is identified by its image id, so the binding does not hold. |
+| [R-18](#r-18) | Medium | Resolved | Set commitments | The policy-set commitment is a Merkle root and the families require Merkle openings as witness, which mandates one proof strategy; a program that recomputes the commitment over the full witness set cannot conform. |
+| [R-19](#r-19) | Low | Resolved | Rationale / hash choice | The claim that security rests on proof-system transparency "not on the commitment hash's output length" is too strong: the hash fixes the collision and second-preimage bounds of every commitment. |
 
 One item outside the numbered findings was fixed alongside them: the
 Validation reject list did not state the `vk_ref` self-authentication check
-that Example 3 and diagram B7 both perform. The draft now makes
-`vk_id = commit(nfc("vk"), vk_bytes)` and `vk_ref` REQUIRED, rejects on
-mismatch, and computes the `vk_id` test vector over example key bytes rather
-than over a descriptor string.
+that Example 3 and diagram B7 both perform. The draft at that point made
+`vk_id = commit(nfc("vk"), vk_bytes)` and `vk_ref` REQUIRED, rejected on
+mismatch, and computed the `vk_id` test vector over example key bytes rather
+than over a descriptor string. R-17 has since made `vk_id` and `vk_ref`
+conditional on the proof system; the self-authentication check is unchanged
+where they are present.
 
 ---
 
@@ -526,6 +535,110 @@ it is a deterministic function of two bound values, and Validation recomputes
 it. Every `statement_hash` vector changes (one fewer `LP("")` segment), and a
 two-receipt recursive vector was added to show the order of computation.
 
+### R-17
+
+**Severity:** High
+**Location:** [Commitments and Identifiers](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#commitments-and-identifiers);
+[`program_registered`](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#program_registered);
+[Validation](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#validation).
+**Diagram:** B1, B5, B6, B7, C4, C5.
+
+**Problem.** The draft defined `program_id = commit(nfc("program"),
+program_descriptor)` over an opaque issuer descriptor and said that the
+binding to what is actually computed is carried by `vk_id`: "a proof that
+verifies under the key `vk_id` commits to was produced by the program that
+key was generated for." That holds for a circuit-specific SNARK, where the
+verifying key is generated per circuit. It does not hold for the zero-knowledge
+virtual machines the draft RECOMMENDS: a zkVM verifier is universal, the same
+key verifies every guest program, and the program that ran is identified by a
+proof-system-native identifier — the RISC Zero ImageID, the SP1 verifying-key
+hash — that the verifier takes as input. Under the draft as written a gateway
+could register one guest and run another under the same `vk_id`, and nothing
+in Validation would notice.
+
+**Proposed resolution** (working-group comment, 2026-10-01). Make `program_id`
+the proof-system-native program identifier, and use `vk_id` only to identify
+verifier-key material where a proof system has any.
+
+**Resolution applied.** As proposed. `program_id` is the 32-byte value the
+registered `proof_system`'s verifier binds an accepting proof to, with the
+derivation fixed per proof system (image identifier for a zkVM;
+`commit(nfc("vk"), vk_bytes)` for a circuit-specific SNARK, where it coincides
+with `vk_id`; `commit(nfc("program"), native_identifier)` when the native
+identifier is not 32 bytes). `vk_id` and `vk_ref` are REQUIRED iff the
+verifier takes key material beyond `program_id` and `params`, and the
+self-authentication check applies only then. `program_registered` is keyed by
+`program_id`, registered at most once; the receipt's `proof.vk_id` and the
+`receipt_issued` `vk_id` are OPTIONAL and MUST agree with the registry entry
+on presence and value. Validation resolves the journal's `program_id` rather
+than `vk_id`, and the proof-verification rule names the verifier's
+parameters. One implementation note was added: a program cannot embed its own
+image identifier, so it takes `program_id` as untrusted input when computing
+`statement_hash` in-circuit, and the auditor's recomputation plus verification
+against the journal's `program_id` closes that gap. The test-vector
+`program_id` is now example identifier bytes rather than a derived
+commitment, so every `statement_hash` vector changed; the `stark_v1` examples
+drop `vk_id`, and the `vk_id` vector is retained for proof systems that carry
+key material. This reverses the earlier promotion of `vk_id` to MUST noted
+below the summary table.
+
+### R-18
+
+**Severity:** Medium
+**Location:** [Commitments and Identifiers](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#commitments-and-identifiers);
+[Output Compliance](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#output-compliance);
+[Tool-Invocation Compliance](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#tool-invocation-compliance).
+**Diagram:** B2, B5, C1, C2.
+
+**Problem.** `set_commit` was a binary Merkle root with RFC 6962 leaf/node
+prefixes, and the Output and Tool families listed "Merkle non-membership
+openings" and "Merkle membership openings" as private witness. Interoperability
+only requires agreement on the commitment; listing openings as witness
+mandated one proof strategy. An implementation that takes the whole
+confidential set as witness, recomputes the commitment in-circuit, and tests
+membership directly (the zkFirewall design) could not conform.
+
+**Proposed resolution** (working-group comment, 2026-10-01). Remove the
+Merkle-specific requirement and define `set_commit` simply over the canonical
+policy set.
+
+**Resolution applied.** As proposed. `set_commit(tag, S)` is one hash over the
+sorted, deduplicated canonical set with the element count prefixed and every
+element length-prefixed; the empty set commits with `n = 0`. The relation is
+defined as recomputing the commitment over the witness set, requiring equality
+with the public value, and evaluating membership or non-membership directly;
+no opening or proof-path format is defined. The family witness bullets, the
+gateway diagram, diagrams B5, C1, and C2, and the Rationale were updated, the
+RFC 6962 and Merkle references were removed, and the three set-commitment
+vectors were regenerated.
+
+### R-19
+
+**Severity:** Low
+**Location:** [Rationale](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#rationale), hash choice relative to HCS-14 and HCS-17;
+[Security Considerations](./ZKBC-Zero-Knowledge-Boundary-Compliance.md#security-considerations).
+
+**Problem.** The Rationale said the post-quantum posture of a deployment
+"rests on the transparency of the proof system, not on the commitment hash's
+output length." Security Considerations already states that security rests
+on the collision and second-preimage resistance of `H`, and the gateway, which
+is adversarial with respect to forgery, controls both preimages of
+`statement_hash`. The hash choice therefore does fix the security bounds, and
+the draft should say which.
+
+**Proposed resolution** (working-group comment, 2026-10-01). State the bounds
+explicitly: with SHA-256 the generic classical levels are approximately 2^128
+for collision resistance and 2^256 for second-preimage resistance.
+
+**Resolution applied.** As proposed, with the quantum bounds alongside
+(approximately 2^128 for second preimages under Grover, no better than about
+2^85 for collisions under Brassard–Høyer–Tapp, whose memory cost keeps the
+practical level near 2^128), a note on which bound is operative where, and
+the defensible form of the original point: the proof system's transparency
+sets the assumption class and `H` sets the numeric bound, and the two are
+independent choices. Security Considerations now points to these bounds, and
+the Grover and Brassard–Høyer–Tapp papers were added as informative references.
+
 ---
 
 ## Sound as specified
@@ -541,8 +654,8 @@ as they are:
   commitment set closes a real re-labelling malleability.
 - **Universal `LP` + domain separation.** Length-prefixing every variable field
   and tagging every commitment with `PROTOCOL_LABEL` and a purpose tag, plus
-  RFC 6962 leaf/node prefixes, is the right discipline for interoperable
-  preimages (diagram B5).
+  the element-count prefix of `set_commit`, is the right discipline for
+  interoperable preimages (diagram B5).
 - **Receipt topics with no admin key.** Reusing HCS-1's immutability rule
   makes the audit trail undeletable and its memo unrewritable.
 - **Consensus timestamp as the clock.** Treating `issued_at` as advisory and
@@ -552,11 +665,12 @@ as they are:
   extension as a permanent public disclosure decision is the correct posture
   for an append-only public ledger.
 - **Transparent, hash-based proof systems as the default.** Keeping
-  pairing-based proofs OPTIONAL and non-post-quantum, and putting the
-  post-quantum posture on proof-system transparency rather than hash length,
-  is coherent with the SHA-256 choice.
-- **Self-authenticating verifying keys.** `vk_id = commit("vk", vk_bytes)`
-  means a registry entry cannot be substituted without detection.
+  pairing-based proofs OPTIONAL and non-post-quantum is coherent with the
+  SHA-256 choice, now that the Rationale states the bounds `H` sets alongside
+  the assumption class transparency provides (R-19).
+- **Self-authenticating verifying keys.** Where a proof system carries
+  verifier-key material, `vk_id = commit("vk", vk_bytes)` means a registry
+  entry cannot be substituted without detection (R-17).
 
 ## License
 

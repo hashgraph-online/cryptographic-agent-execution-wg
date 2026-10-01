@@ -287,17 +287,17 @@ flowchart TB
   GWt <-->|"invocation / result"| Tools
   GWw <-->|"request / response"| Web
 
-  Gateways -->|"receipt_issued — journal inline, proof_ref, vk_id"| RT
+  Gateways -->|"receipt_issued — journal inline, proof_ref"| RT
   Gateways -->|"store deterministic-CBOR receipt"| F1
   Issuer -->|"policy_published · policy_revoked"| PR
   Issuer -->|"program_registered"| GR
-  Issuer -->|"store verifying key — vk_ref"| F1
+  Issuer -->|"store verifying key — vk_ref, where the proof system has one"| F1
   Issuer -.->|"distributes policy content — off-graph, confidential"| Gateways
 
   P11 -.->|"discover authentic topic ids"| Auditor
   RT -->|"read journals, verdicts, sequence_ranges"| Auditor
   PR -->|"resolve policy_id at consensus timestamp"| Auditor
-  GR -->|"resolve vk_id → program_id, proof_system"| Auditor
+  GR -->|"resolve program_id → proof_system, params, vk_id if any"| Auditor
   F1 -->|"fetch receipt · verifying key"| Auditor
 ```
 
@@ -476,14 +476,14 @@ flowchart TB
   Rel1["Release action to the external party"]
   Rel2["Release action to the external party"]
 
-  Wit["Phase 2 — build private witness<br/>action records · policy sets · Merkle openings · identities"]
+  Wit["Phase 2 — build private witness<br/>action records · policy sets · identities"]
   Stmt["Assemble public statement → statement_hash"]
   Prove["Generate zero-knowledge proof<br/>binds action · policy version · session · sequence_range"]
   Defect["Gateway defect<br/>MUST NOT publish the range · SHOULD alert<br/>gap visible to auditors"]
   Hold["HOLD — fail-closed<br/>signal prover_unavailable, distinct from policy_rejected<br/>MUST NOT release · sequence_no retained"]
-  Rcpt["Assemble receipt — deterministic CBOR<br/>journal + proof {system, params, bytes, vk_id}"]
+  Rcpt["Assemble receipt — deterministic CBOR<br/>journal + proof {system, params, bytes, vk_id if any}"]
   Store["Store receipt as HCS-1 file → proof_ref"]
-  Pub["Publish receipt_issued to receipt topic<br/>journal inline · proof_ref · vk_id · txn memo hcs-xx:op:0:0"]
+  Pub["Publish receipt_issued to receipt topic<br/>journal inline · proof_ref · txn memo hcs-xx:op:0:0"]
 
   In --> Cap --> Canon --> Pre
   Pre -->|"no"| Rej --> Regen --> In
@@ -597,19 +597,23 @@ commit(tag, m) = H( LP(PROTOCOL_LABEL) || LP(tag) || LP(m) )
 ```
 
 **Set commitment.** A policy set (forbidden set, allowlist, sensitive-key set) is
-committed as a binary Merkle root over sorted, deduplicated, domain-separated
-leaves, enabling in-circuit membership / non-membership proofs. Let the canonical
+committed as a single hash over the whole canonical set. Let the canonical
 elements be `e_1..e_n` in ascending byte order with duplicates removed:
 
 ```
-leaf(tag, e)   = H( byte(0x00) || LP(PROTOCOL_LABEL) || LP(tag) || LP(e) )
-node(l, r)     = H( byte(0x01) || l || r )
+set_commit(tag, S) = H( LP(PROTOCOL_LABEL) || LP(tag) || uint64be(n)
+                          || LP(e_1) || ... || LP(e_n) )
 ```
 
-Leaves are padded with `leaf(tag, "")` up to the next power of two (an empty set
-commits to `leaf(tag, "")`), then folded pairwise left-to-right until a single
-32-byte root remains. The `0x00`/`0x01` prefixes give leaf/node domain separation
-(cf. RFC 6962, §2.1).
+An empty set commits with `n = 0` and no element segments. The element count
+and the per-element length prefixes make the preimage unambiguous, and set tags
+are never reused by the scalar construction. The commitment is over the
+*set*, not over any auxiliary structure: the compliance program takes the full
+confidential set as private witness, recomputes `set_commit` over it, requires
+the result to equal the public commitment, and evaluates membership or
+non-membership directly against the witness set. This document defines no
+opening or proof-path format; how a program organizes the set internally is
+its own concern and is invisible to the auditor.
 
 **Identity digest** (access family) binds the access decision to a public digest
 over the private tenant and user identities:
@@ -623,18 +627,36 @@ identity_digest = H( LP(PROTOCOL_LABEL) || LP(nfc("identity"))
 
 - `session_id` — opaque session identifier; RECOMMENDED 16 uniformly random
   bytes, carried on the wire as base64url or as a UUID string.
-- `program_id = commit(nfc("program"), program_descriptor)` — 32-byte
-  identifier of a registered compliance program. `program_descriptor` is
-  issuer-defined (a name and version, a source or image digest), and nothing in
-  this document recomputes it; `program_id` therefore tells an independent
-  verifier that two receipts cite the same registered program, not what that
-  program computes. The binding to what is actually computed is carried by
-  `vk_id`: a proof that verifies under the key `vk_id` commits to was produced
-  by the program that key was generated for.
+- `program_id` — the proof-system-native program identifier: the 32-byte
+  value that the verifier of the registered `proof_system` binds an accepting
+  proof to. Each registered proof system fixes the derivation. For a
+  zero-knowledge virtual machine it is the image identifier of the guest
+  program (for example the RISC Zero ImageID, or the SP1 verifying-key hash),
+  a digest of the program's initial memory image that the verifier checks the
+  proof against directly. For a circuit-specific SNARK whose verifier is
+  parameterized by a per-circuit verifying key, it is
+  `commit(nfc("vk"), vk_bytes)`, and `program_id` and `vk_id` coincide. A
+  proof system whose native identifier is not 32 bytes defines
+  `program_id = commit(nfc("program"), native_identifier)`. Because the
+  verifier itself rejects a proof that was not produced by the program
+  `program_id` names, an accepting proof establishes *what was computed*, not
+  merely which registry entry was cited; the
+  [`program_registered`](#program_registered) entry supplies the proof system,
+  its parameters, and any verifier-key material, and any source or build
+  descriptor it carries is informative. A program cannot embed its own native
+  identifier (an image identifier is a hash of the program), so a program that
+  computes `statement_hash` in-circuit receives `program_id` as an untrusted
+  input; the auditor's recomputation of `statement_hash` from the journal,
+  together with verification against the journal's `program_id`, rejects any
+  receipt whose in-circuit value differs.
 - `vk_id = commit(nfc("vk"), vk_bytes)` — 32-byte verifying-key identity, where
-  `vk_bytes` is the verifying key in the serialization its `proof_system`
-  defines. The construction is REQUIRED: it makes a verifying key fetched from
-  the registry (see [`program_registered`](#program_registered))
+  `vk_bytes` is verifying-key material in the serialization its `proof_system`
+  defines. It is present only when the registered proof system's verifier
+  takes key material beyond `program_id` and `params` — a per-circuit SNARK
+  verifying key, or the key of a universal wrapper circuit — and absent for a
+  proof system whose verifier is parameterized by the program identifier
+  alone. When present the construction is REQUIRED: it makes a verifying key
+  fetched from the registry (see [`program_registered`](#program_registered))
   self-authenticating — the auditor recomputes the commitment over the fetched
   bytes and rejects on mismatch — so the registry publisher cannot substitute a
   key under an existing identity.
@@ -662,8 +684,8 @@ Constrains information released to the user or a downstream consumer.
   REQUIRED canonicalization commitment `commit_key "output.canonicalization"`;
   the verdict; and OPTIONAL counts (`token_count`, `distinct_token_count`,
   `hit_count`).
-- **Private witness:** the raw output, the forbidden set `F`, and the Merkle
-  non-membership openings.
+- **Private witness:** the raw output and the forbidden set `F`; the relation
+  recomputes `set_commit` over `F` and matches it to the public commitment.
 
 #### Tool-Invocation Compliance
 
@@ -683,7 +705,8 @@ Constrains external actions. It combines two relations:
   `set_commit("policy/tool/sensitive-keys", K)`; the verdict; and OPTIONAL counts
   (`invocation_count`, `argument_count`, `sensitive_argument_count`).
 - **Private witness:** tool arguments, the allowlist `A`, the sensitive-key set
-  `K`, sanitization outcomes, and the Merkle openings.
+  `K`, and the sanitization outcomes; the relation recomputes `set_commit` over
+  `A` and over `K` and matches each to its public commitment.
 
 **Web channel.** A `web` request is evaluated under this family. The tool
 identifier is the request target's scheme and host, `scheme "://" host`,
@@ -758,7 +781,7 @@ circular. It needs no separate binding — it is a deterministic function of
 Two further journal fields are deliberately **not** bound: `issued_at` and
 `proof_system`. The consensus timestamp supersedes the former (see
 [Timestamp Trust](#5-timestamp-trust)), and the latter is fixed by the
-`program_registered` entry that `vk_id` resolves to, which
+`program_registered` entry that `program_id` resolves to, which
 [Validation](#validation) compares with the journal. Every other journal field
 is in the preimage, is `statement_hash` itself, or is derived from it.
 
@@ -825,7 +848,7 @@ statement — nothing more. Its fields:
 | `issued_at`         | RFC 3339 UTC timestamp                       | ✓   | when the proof was generated |
 | `policy_id`         | string (issuer-scoped label)                 | ✓   | human-readable policy identity; bound into `statement_hash` |
 | `policy_commitments`| map<string, base64url(32 B)> (≥1 entry)      | ✓   | per-family policy commitments (see families); MUST include `output.canonicalization` when `family` includes `output` |
-| `program_id`        | base64url(32 B)                              | ✓   | commitment to the compliance program |
+| `program_id`        | base64url(32 B)                              | ✓   | proof-system-native program identifier (see [Commitments and Identifiers](#commitments-and-identifiers)) |
 | `proof_system`      | registered identifier string                 | ✓   | selects the verifier (e.g. `stark_v1`) |
 | `mode`              | enum `{ batch, real_time, recursive }`       | ✓   | proof mode |
 | `family`            | array of enum `{ output, tool, access }`     | ✓   | families covered by this proof; MUST be listed in the order `output`, `tool`, `access`, without duplicates |
@@ -871,14 +894,16 @@ receipt:
     system      : registered identifier string   (MUST equal journal.proof_system)
     params      : OPTIONAL parameter-set identifier (curve/field/security level)
     bytes       : base64url(proof)                (opaque proof bytes)
-    vk_id       : base64url(32 B)                 (verifying-key identity)
+    vk_id       : OPTIONAL base64url(32 B)        (verifying-key identity; present iff
+                                                   the program's registry entry carries one)
 ```
 
-`vk_id` MUST bind to `program_id` through the issuer's program registry (see
-[`program_registered`](#program_registered)); the auditor selects the verifier by
-`(system, vk_id)`, checks `vk_id` resolves to `program_id`, reconstructs
-`statement_hash` from the journal, and verifies the proof against that public
-statement. Receipts SHOULD be served with media type
+`journal.program_id` MUST resolve through the issuer's program registry (see
+[`program_registered`](#program_registered)) to an entry whose `proof_system`
+equals `proof.system`; the auditor selects the verifier by
+`(system, program_id)`, parameterized by `params` and by the registered key
+material where `vk_id` is present, reconstructs `statement_hash` from the
+journal, and verifies the proof against that public statement. Receipts SHOULD be served with media type
 `application/zkbc-receipt+cbor` (or `+json`). A receipt is self-contained and
 location-independent: verification MUST NOT depend on any secret channel state.
 
@@ -1094,7 +1119,7 @@ file.
 | `account_id` | Publishing gateway's account ID                                    | string | Yes |
 | `journal`    | Journal object per [Public Compliance Journal](#public-compliance-journal) | object | Yes |
 | `proof_ref`  | HRL of the stored receipt, `hcs://1/<topicId>`                     | string | Yes |
-| `vk_id`      | base64url(32 B); MUST equal the receipt's `proof.vk_id`            | string | Yes |
+| `vk_id`      | base64url(32 B); MUST be present iff the receipt's `proof.vk_id` is, and equal it | string | No |
 | `m`          | Optional memo                                                      | string | No |
 
 The inline `journal` MUST equal the `journal` member of the referenced receipt
@@ -1107,7 +1132,6 @@ The inline `journal` MUST equal the `journal` member of the referenced receipt
   "account_id": "0.0.500200",
   "journal": { "version": "ZKBC/1.0", "...": "..." },
   "proof_ref": "hcs://1/0.0.600010",
-  "vk_id": "761BxFWRjz9Ye36ZQMcsnIJrjs2frx4Zi8LFYpEs4ys",
   "m": "session receipt"
 }
 ```
@@ -1143,7 +1167,7 @@ the prover-asserted `issued_at` does not.
 | `account_id`         | Issuer's account ID                                    | string | Yes |
 | `policy_id`          | Issuer-scoped policy label (e.g. `acme.pii.v3`)        | string | Yes |
 | `policy_commitments` | map<string, base64url(32 B)>, as in the journal        | object | Yes |
-| `program_id`         | base64url(32 B) program commitment evaluating this policy | string | Yes |
+| `program_id`         | base64url(32 B) identifier of the program evaluating this policy | string | Yes |
 | `program_registry_topic_id` | Topic ID of the program registry (type 2) holding the `program_registered` entry for `program_id` | string | Yes |
 | `effective_from`     | RFC 3339 UTC timestamp                                 | string | Yes |
 | `m`                  | Optional memo                                          | string | No |
@@ -1151,8 +1175,9 @@ the prover-asserted `issued_at` does not.
 `program_registry_topic_id` makes the program registry reachable from on-graph
 data alone: an auditor holding only a receipt topic ID follows its memo to the
 policy registry, resolves the receipt's `policy_id`, and follows this field to
-the registry where `vk_id` is bound to `program_id`. The issuer operates both
-registries, so it always knows the ID.
+the registry where `program_id` is bound to its proof system, parameters, and
+any verifier-key material. The issuer operates both registries, so it always
+knows the ID.
 
 ```json
 {
@@ -1162,9 +1187,9 @@ registries, so it always knows the ID.
   "policy_id": "acme.pii.v3",
   "policy_commitments": {
     "output.canonicalization": "Hjqh1F8wQGk4ird2ieABh7z51GFvBdmuSAiSfKsLAWQ",
-    "output.forbidden": "cLNTZc_gx1gjaf2Qdkj8jlVwHsb8wIwYEE_Iqwpj5To"
+    "output.forbidden": "bhvFupsp0G827gHRZoI0GVvoryPXhZEnqFvU-v9TbwU"
   },
-  "program_id": "ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s",
+  "program_id": "emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8",
   "program_registry_topic_id": "0.0.600003",
   "effective_from": "2026-07-01T00:00:00Z",
   "m": "PII policy v3"
@@ -1192,9 +1217,11 @@ MUST be ignored, so issuers version their labels (`acme.pii.v3` → `acme.pii.v4
 
 #### `program_registered`
 
-Published by the issuer to the program registry (type 2) to bind a verifying
-key to a compliance program. This is the on-graph realization of the
-`vk_id → program_id` binding required by the
+Published by the issuer to the program registry (type 2) to bind a compliance
+program, named by its proof-system-native `program_id`, to the proof system
+that verifies it and to any verifier-key material that verification needs.
+This is the on-graph realization of the `program_id → proof_system` resolution
+required by the
 [Compliance Receipt Wire Format](#compliance-receipt-wire-format).
 
 | Field          | Description                                                    | Type   | Required |
@@ -1202,32 +1229,37 @@ key to a compliance program. This is the on-graph realization of the
 | `p`            | Protocol identifier, always `"hcs-xx"`                         | string | Yes |
 | `op`           | Always `"program_registered"`                                  | string | Yes |
 | `account_id`   | Issuer's account ID                                            | string | Yes |
-| `program_id`   | base64url(32 B) program commitment                             | string | Yes |
-| `vk_id`        | base64url(32 B) verifying-key identity                         | string | Yes |
+| `program_id`   | base64url(32 B) proof-system-native program identifier         | string | Yes |
 | `proof_system` | Registered proof-system identifier (e.g. `stark_v1`)           | string | Yes |
 | `params`       | Parameter-set identifier (curve/field/security level)          | string | No |
-| `vk_ref`       | HRL of the verifying-key bytes stored via HCS-1, `hcs://1/<topicId>` | string | Yes |
+| `vk_id`        | base64url(32 B) verifying-key identity; REQUIRED iff the proof system's verifier takes key material beyond `program_id` and `params` | string | Conditional |
+| `vk_ref`       | HRL of the verifying-key bytes stored via HCS-1, `hcs://1/<topicId>`; REQUIRED iff `vk_id` is present | string | Conditional |
 | `m`            | Optional memo                                                  | string | No |
 
-`vk_id` MUST equal `commit(nfc("vk"), vk_bytes)` over the bytes stored at
-`vk_ref`, so that the fetched key is self-authenticating: the auditor
-recomputes the commitment over the fetched bytes and rejects on mismatch. The
-registry's `vk_id → program_id` link is the issuer's assertion, authenticated
-by the registry's submit key; the `vk_id → vk_bytes` link is a computation any
-auditor repeats. When `params` is present, a receipt's `proof.params` MUST
-equal it (see [Validation](#validation)). A `vk_id` MUST be registered at most
-once per registry; consumers use the earliest `program_registered` entry for a
-`vk_id` and ignore later ones.
+`program_id` is derived from the program as the registered `proof_system`
+defines (see [Commitments and Identifiers](#commitments-and-identifiers)); an
+auditor holding the program artifact MAY recompute it. When present, `vk_id`
+MUST equal `commit(nfc("vk"), vk_bytes)` over the bytes stored at `vk_ref`, so
+that the fetched key is self-authenticating: the auditor recomputes the
+commitment over the fetched bytes and rejects on mismatch. The registry's
+`program_id → (proof_system, params, vk_id)` link is the issuer's assertion,
+authenticated by the registry's submit key; the `program_id → program` link
+and the `vk_id → vk_bytes` link are computations any auditor repeats. When
+`params` is present, a receipt's `proof.params` MUST equal it (see
+[Validation](#validation)). A `program_id` MUST be registered at most once per
+registry; consumers use the earliest `program_registered` entry for a
+`program_id` and ignore later ones.
+
+The example registers a program for a proof system whose verifier is
+parameterized by `program_id` alone, so `vk_id` and `vk_ref` are absent:
 
 ```json
 {
   "p": "hcs-xx",
   "op": "program_registered",
   "account_id": "0.0.500100",
-  "program_id": "ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s",
-  "vk_id": "761BxFWRjz9Ye36ZQMcsnIJrjs2frx4Zi8LFYpEs4ys",
+  "program_id": "emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8",
   "proof_system": "stark_v1",
-  "vk_ref": "hcs://1/0.0.600011",
   "m": "output policy program v1"
 }
 ```
@@ -1260,12 +1292,14 @@ any of the following holds:
   `mode` is `real_time`;
 - the journal's `family` array is empty, contains a duplicate, or is not in
   the order `output`, `tool`, `access`;
-- `vk_id` has no `program_registered` entry in the program registry, or the
-  entry's `program_id` differs from the journal's `program_id`, or the entry's
-  `proof_system` differs from the journal's `proof_system`;
+- the journal's `program_id` has no `program_registered` entry in the program
+  registry, or the entry's `proof_system` differs from the journal's
+  `proof_system`;
 - the entry's `params` and the receipt's `proof.params` differ, where either is
   present (one present and the other absent is a difference);
-- `vk_ref` does not resolve to a valid HCS-1 file, or
+- the entry's `vk_id` and the receipt's `proof.vk_id` differ, where either is
+  present (one present and the other absent is a difference); or, when
+  present, `vk_ref` does not resolve to a valid HCS-1 file, or
   `commit(nfc("vk"), vk_bytes)` recomputed over the fetched key bytes differs
   from `vk_id`;
 - no `policy_published` entry for the journal's `policy_id` is in effect at the
@@ -1278,7 +1312,10 @@ any of the following holds:
 - the verifier cannot reproduce the Unicode version, normalization forms, or
   tokenizer named in the resolved canonicalization descriptor — the receipt MUST
   be rejected rather than verified under different text-processing semantics;
-- proof verification against the reconstructed public statement fails;
+- proof verification against the reconstructed public statement fails, under
+  the verifier that `proof_system` selects, parameterized by the journal's
+  `program_id`, by `params`, and by the registered key material where `vk_id`
+  is present;
 - in recursive mode, the chain-digest recurrence does not hold: `chain_digest`
   MUST equal the [Proof Modes](#proof-modes) construction over the journal's
   `prev_chain_digest` and `statement_hash`, and `prev_chain_digest` MUST be
@@ -1334,12 +1371,12 @@ flowchart TB
     R3{"proof_ref resolves to a valid HCS-1 file whose journal equals the inline journal?"}
     R4{"verdict = compliant?"}
     R5{"sequence_range has 1 ≤ from ≤ to, and from = to when mode = real_time?<br/>family non-empty, no duplicates, in order output · tool · access?"}
-    R6{"vk_id has a program_registered entry with matching program_id, proof_system, and params?"}
-    R7{"vk_ref resolves, and commit(vk, fetched bytes) equals vk_id?"}
+    R6{"journal.program_id has a program_registered entry with matching proof_system and params?"}
+    R7{"vk_id absent on both sides, or equal on both sides with vk_ref resolving and commit(vk, fetched bytes) equal to vk_id?"}
     R8{"a policy_published for policy_id is in effect at the consensus timestamp<br/>(max(consensus_ts, effective_from) ≤ t_r, not revoked)<br/>and its policy_commitments and program_id match?"}
     R9{"family includes output ⇒ output.canonicalization present?"}
     R10{"verifier reproduces the pinned Unicode version, normalization forms, and tokenizer?"}
-    R11{"proof verifies against the reconstructed public statement?"}
+    R11{"proof verifies against the reconstructed public statement<br/>under the verifier for proof_system, parameterized by program_id, params, and any registered key?"}
     R12{"mode = recursive ⇒ chain_digest recomputes, and prev_chain_digest is empty at genesis<br/>or equals chain_digest of the preceding recursive receipt, same topic and session?"}
     X1["REJECT"]
     X2["REJECT"]
@@ -1460,9 +1497,12 @@ additionally be listed in HCS-2 registries for discovery.
 
 **Step 2: Policy and Program Registration (issuer)**
 
-1. Compile the compliance program; compute `program_id`; store the verifying
-   key via HCS-1; compute `vk_id = commit(nfc("vk"), vk_bytes)` over the stored
-   bytes; publish `program_registered` with `vk_ref`.
+1. Compile the compliance program; take `program_id` as the proof system's
+   native identifier of the compiled program. If the proof system's verifier
+   takes key material, store the verifying key via HCS-1 and compute
+   `vk_id = commit(nfc("vk"), vk_bytes)` over the stored bytes. Publish
+   `program_registered` with `proof_system`, `params`, and, where present,
+   `vk_id` and `vk_ref`.
 2. Commit the policy sets; publish `policy_published` with the commitments,
    `program_id`, `program_registry_topic_id`, and `effective_from`.
 
@@ -1487,11 +1527,13 @@ sequenceDiagram
   Gateway->>P11: add zkbc block (receipt_topic_ids, policy registry, program registry topic ids, proof_systems)
 
   Note over Issuer,F1: Step 2 — Program and policy registration
-  Issuer->>Issuer: compile compliance program · program_id = commit("program", descriptor)
-  Issuer->>F1: store verifying-key bytes
-  F1-->>Issuer: vk_ref = hcs://1/topicId
-  Issuer->>Issuer: vk_id = commit("vk", vk_bytes)
-  Issuer->>GR: program_registered {program_id, vk_id, proof_system, vk_ref, params?}
+  Issuer->>Issuer: compile compliance program · program_id = proof-system-native identifier (e.g. zkVM image id)
+  opt proof system's verifier takes key material
+    Issuer->>F1: store verifying-key bytes
+    F1-->>Issuer: vk_ref = hcs://1/topicId
+    Issuer->>Issuer: vk_id = commit("vk", vk_bytes)
+  end
+  Issuer->>GR: program_registered {program_id, proof_system, params?, vk_id?, vk_ref?}
   Issuer->>Issuer: set_commit forbidden F · allowlist A · sensitive keys K · commit canonicalization descriptor · access descriptor
   Issuer->>PR: policy_published {policy_id, policy_commitments, program_id, program_registry_topic_id, effective_from}
   Issuer-->>Gateway: distribute policy content off-graph (confidential)
@@ -1520,8 +1562,8 @@ sequenceDiagram
 
 1. Discover topics from the agent's HCS-11 profile.
 2. Read `receipt_issued` messages; apply every rule in
-   [Validation](#validation): recompute `statement_hash`, resolve `vk_id` and
-   `policy_id` through the registries, fetch the receipt, verify the proof.
+   [Validation](#validation): recompute `statement_hash`, resolve `program_id`
+   and `policy_id` through the registries, fetch the receipt, verify the proof.
 3. Apply the coverage check per session across every receipt topic in the
    profile, in every mode, and, for recursive mode, the chain-digest
    recurrence.
@@ -1555,8 +1597,20 @@ argument keys, and Unicode NFC / UAX #29 for text. The one construction the
 standard pins itself — universal length-prefixed, domain-separated hashing — is
 mandatory because interoperable commitments require every implementation to agree
 on the exact preimage bytes; the `LP` discipline prevents field-boundary
-ambiguity and the `PROTOCOL_LABEL`/`tag` and leaf/node prefixes prevent
-cross-context second preimages.
+ambiguity and the `PROTOCOL_LABEL`/`tag` discipline and the element-count
+prefix of `set_commit` prevent cross-context second preimages.
+
+**Set commitments without openings.** Interoperability requires every party to
+agree on the commitment to a policy set, not on how a program proves facts
+about it. `set_commit` is therefore a single hash over the canonical set, and
+the relation is defined as recomputing that hash over the witness set and
+evaluating membership directly. This keeps the proof-system interface to one
+public value per set, leaves the program free to index the set however it
+likes, and avoids standardizing an opening format that an auditor never sees.
+The cost is linear in the size of the set per proof, which is small next to
+the cost of proving the relation itself; a deployment with very large sets
+chooses the batch or recursive mode so that the set is hashed once per window
+rather than once per action.
 
 **Two normalization forms rather than one.** A single NFC-based normalizer for
 both tool identifiers and output tokens would be unsound, because the two
@@ -1589,11 +1643,25 @@ length-prefixed field and closes that malleability.
 for long-lived identifiers, citing quantum resistance. ZKBC's default is SHA-256
 because its commitments are evaluated *inside* zero-knowledge circuits, where
 hash cost dominates prover time and SHA-256 is the best-supported choice across
-zero-knowledge toolchains; because `H` is explicitly substitutable per
+zero-knowledge toolchains, and because `H` is explicitly substitutable per
 deployment (SHA-384 and arithmetization-friendly sponges are both permitted
-profiles); and because the post-quantum posture of a ZKBC deployment rests on
-the transparency of the proof system, not on the commitment hash's output
-length. This is a documented deviation under the HCS-4 conventions.
+profiles). The choice of `H` does set the security bounds of every commitment
+in this document. With SHA-256 the generic classical bounds are approximately
+2^128 for collision resistance and 2^256 for second-preimage resistance;
+against a quantum adversary they are approximately 2^128 for second preimages
+(Grover) and no better than about 2^85 for collisions (Brassard–Høyer–Tapp),
+whose memory requirements keep the practical level near 2^128. Collision
+resistance is the operative bound wherever one party controls both preimages —
+a gateway constructing `statement_hash`, an issuer constructing a policy
+commitment — and second-preimage resistance where an adversary attacks a
+commitment already published. These bounds sit at or above the conjectured
+soundness of typical transparent proof-system parameter sets, on the order of
+100 bits, which is why a longer hash output does not by itself raise the
+security of a receipt. The proof system's transparency determines the
+*assumption class* — no trusted setup, no pairing or discrete-logarithm
+assumption — and `H` determines the numeric bound; the two are independent
+choices. A deployment that requires a 192-bit collision bound selects the
+SHA-384 profile. This is a documented deviation under the HCS-4 conventions.
 
 ### Deployment Profiles (Informative)
 
@@ -1659,8 +1727,10 @@ with plaintext exactly as it already is when hosting the agent. Running the
 gateway inside a trusted execution environment, or mediating end-to-end
 encrypted channels that terminate inside one, would narrow this trust; both
 are compatible with this specification and out of scope for this version (see
-[Backwards Compatibility](#backwards-compatibility)). Security rests on the soundness and zero-knowledge of the
-proof system and on the collision and second-preimage resistance of `H`.
+[Backwards Compatibility](#backwards-compatibility)). Security rests on the
+soundness and zero-knowledge of the proof system and on the collision and
+second-preimage resistance of `H`; the bounds `H` sets are stated in
+[Rationale](#rationale).
 
 A conforming deployment MUST provide:
 
@@ -1850,7 +1920,8 @@ byte order. All digests are shown base64url (unpadded).
 Inputs:
 
 ```
-program_descriptor      = "zkbc.output.v1"
+program_id (32 B, hex)  = 7a6b5c4d3e2f10010203040506070809a0b1c2d3e4f5061728394a5b6c7d8e9f
+                          (an example proof-system-native identifier, e.g. a zkVM image id)
 forbidden set F         = { "credit_card", "ssn" }
 allowlist A             = { "calculator", "email.send", "search" }
 sensitive-key set K     = { "password", "ssn", "to" }
@@ -1864,6 +1935,8 @@ verdict                 = compliant (0x01)
 sequence_range          = { from: 1, to: 1 }
 counts.output           = { token_count: 128, distinct_token_count: 42, hit_count: 0 }
 vk_bytes (32 B, hex)    = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+                          (used only by the vk_id vector; a proof system whose
+                          verifier takes key material)
 
 batch variant (same inputs except):
 mode                    = batch (0x01)
@@ -1883,20 +1956,20 @@ canonicalization_descriptor (RFC 8785 canonical JSON, one line):
 Outputs:
 
 ```
-program_id (commit "program")                       = ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s
-set_commit "policy/output/forbidden" (F)            = cLNTZc_gx1gjaf2Qdkj8jlVwHsb8wIwYEE_Iqwpj5To
-set_commit "policy/tool/allowlist" (A)              = f2IXNmgMhZBMaCvXu1AeMN6q1njWL-p1AeZvhNRxlE0
-set_commit "policy/tool/sensitive-keys" (K)         = TndiGql4TnkZSuk_KU8aKO_V3RiQCvwWUJE5gFASRr0
+program_id (base64url of the bytes above)           = emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8
+set_commit "policy/output/forbidden" (F)            = bhvFupsp0G827gHRZoI0GVvoryPXhZEnqFvU-v9TbwU
+set_commit "policy/tool/allowlist" (A)              = 6DIBHki0Y_W8SCJGEBcbQ9GtqVXQwn7eqbRP1uT_p6g
+set_commit "policy/tool/sensitive-keys" (K)         = MGm2aiwVvB7qr6sZi23lXTx8Scbd3yGpYIGmgQl6JlM
 commit "policy/canonicalization" (descriptor)       = Hjqh1F8wQGk4ird2ieABh7z51GFvBdmuSAiSfKsLAWQ
 identity_digest(acme, alice@acme.example)           = 9D17KQnykuItOrT_8T8MvBdToKflK-Xc5TpsIK4v54k
 session_id (base64url)                              = Sh-cDot9al9OPCsaCYdlQw
-statement_hash (output / real_time / range 1..1)    = GqN3J7ZcmJ5DHMHZlKVG3clUIp9SSgT0JWRbMM_cUHk
-statement_hash (batch variant, range 1..3)          = ttSNAAyuh9xJhQ4xxmTazfIBmSS-_LZi-cSsJy88pzU
-statement_hash (recursive #0, 1..3, prev = "")      = 7z1mRVTwugEbqLYI2qLE0XKZsNwkV-uMBjGP7SEQ9PI
-chain_digest   (recursive #0, genesis)              = wEC8xm88i07lUwHJjppXuObdAJ8UUJ1AHsVnOvsUX4o
-statement_hash (recursive #1, 4..5)                 = 2d_TvzkoaX-3gahMYWy558ZbwOUuk_UGTioU8mBrxPE
-chain_digest   (recursive #1)                       = 7RbQlABBUZPSpZfRdk0lglw7EY2EjDZZL-JlHRnt_IM
-vk_id (commit "vk" over vk_bytes)                   = 761BxFWRjz9Ye36ZQMcsnIJrjs2frx4Zi8LFYpEs4ys
+statement_hash (output / real_time / range 1..1)    = 3G4E9re7hfevvMcL0ua9mVvjBiLbrLq72kuryUTpAF0
+statement_hash (batch variant, range 1..3)          = JQkHNtF0yDqTPFpVQMMfJ2EF8LC2Ajdy_wWWTtzRFDI
+statement_hash (recursive #0, 1..3, prev = "")      = Q9gW471uRmIHzK2VrVDRrBRuax3v2mvN-De1TAkJ6Dg
+chain_digest   (recursive #0, genesis)              = Gn_susg9G4WHbo6E78tYrDEo7LGD65OIIB50G6NC1ew
+statement_hash (recursive #1, 4..5)                 = 31Xka7cAiRbD9GDNEyWH3oeQ3Aknw8wlhcxf4UmP298
+chain_digest   (recursive #1)                       = uS9qoR41YFg9HgUC5qZmMuQqKgVlqXDjdUXruQO2iK4
+vk_id (commit "vk" over vk_bytes; when present)     = 761BxFWRjz9Ye36ZQMcsnIJrjs2frx4Zi8LFYpEs4ys
 ```
 
 The batch variant differs from the real-time vector only in `byte(mode)`, the
@@ -1929,14 +2002,14 @@ A conforming journal for the vector above (JSON form):
   "policy_id": "acme.pii.v3",
   "policy_commitments": {
     "output.canonicalization": "Hjqh1F8wQGk4ird2ieABh7z51GFvBdmuSAiSfKsLAWQ",
-    "output.forbidden": "cLNTZc_gx1gjaf2Qdkj8jlVwHsb8wIwYEE_Iqwpj5To"
+    "output.forbidden": "bhvFupsp0G827gHRZoI0GVvoryPXhZEnqFvU-v9TbwU"
   },
-  "program_id": "ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s",
+  "program_id": "emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8",
   "proof_system": "stark_v1",
   "mode": "real_time",
   "family": ["output"],
   "verdict": "compliant",
-  "statement_hash": "GqN3J7ZcmJ5DHMHZlKVG3clUIp9SSgT0JWRbMM_cUHk",
+  "statement_hash": "3G4E9re7hfevvMcL0ua9mVvjBiLbrLq72kuryUTpAF0",
   "sequence_range": { "from": 1, "to": 1 },
   "counts": { "output": { "token_count": 128, "distinct_token_count": 42, "hit_count": 0 } }
 }
@@ -1956,9 +2029,9 @@ policy_published txn memo = hcs-xx:op:1:1
 Expected validation outcomes for the journal above, per
 [Validation](#validation):
 
-- Published unmodified in a `receipt_issued` operation whose `vk_id` resolves
-  through the program registry to the journal's `program_id`: **accepted**
-  (subject to proof verification).
+- Published unmodified in a `receipt_issued` operation whose journal
+  `program_id` resolves through the program registry to an entry with
+  `proof_system = stark_v1`: **accepted** (subject to proof verification).
 - Same journal with `verdict` changed to `"non_compliant"`: **rejected** —
   recomputed `statement_hash` no longer equals the journal's (and the value is
   reserved).
@@ -1967,7 +2040,10 @@ Expected validation outcomes for the journal above, per
 - A second accepted receipt for the same `session_id` that also covers
   position `1`: both remain accepted, and the session's **coverage claim is
   void** (overlap).
-- Same operation with a `vk_id` absent from the program registry: **rejected**.
+- Same journal with a `program_id` absent from the program registry:
+  **rejected**.
+- Same receipt with a `proof.vk_id` present although the registry entry
+  carries none: **rejected**.
 - Same message with `"p": "hcs-2"`: **ignored** — protocol identifier does not
   match the topic memo.
 
@@ -1991,19 +2067,18 @@ receipt topic (transaction memo `hcs-xx:op:0:0`):
     "policy_id": "acme.pii.v3",
     "policy_commitments": {
       "output.canonicalization": "Hjqh1F8wQGk4ird2ieABh7z51GFvBdmuSAiSfKsLAWQ",
-      "output.forbidden": "cLNTZc_gx1gjaf2Qdkj8jlVwHsb8wIwYEE_Iqwpj5To"
+      "output.forbidden": "bhvFupsp0G827gHRZoI0GVvoryPXhZEnqFvU-v9TbwU"
     },
-    "program_id": "ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s",
+    "program_id": "emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8",
     "proof_system": "stark_v1",
     "mode": "real_time",
     "family": ["output"],
     "verdict": "compliant",
-    "statement_hash": "GqN3J7ZcmJ5DHMHZlKVG3clUIp9SSgT0JWRbMM_cUHk",
+    "statement_hash": "3G4E9re7hfevvMcL0ua9mVvjBiLbrLq72kuryUTpAF0",
     "sequence_range": { "from": 1, "to": 1 },
     "counts": { "output": { "token_count": 128, "distinct_token_count": 42, "hit_count": 0 } }
   },
   "proof_ref": "hcs://1/0.0.600010",
-  "vk_id": "761BxFWRjz9Ye36ZQMcsnIJrjs2frx4Zi8LFYpEs4ys",
   "m": "customer-service response released"
 }
 ```
@@ -2021,9 +2096,9 @@ The issuer (`0.0.500100`) publishes the PII policy the receipt above cites
   "policy_id": "acme.pii.v3",
   "policy_commitments": {
     "output.canonicalization": "Hjqh1F8wQGk4ird2ieABh7z51GFvBdmuSAiSfKsLAWQ",
-    "output.forbidden": "cLNTZc_gx1gjaf2Qdkj8jlVwHsb8wIwYEE_Iqwpj5To"
+    "output.forbidden": "bhvFupsp0G827gHRZoI0GVvoryPXhZEnqFvU-v9TbwU"
   },
-  "program_id": "ibCgW52cHOKAo4hkZ16WRX-8QXynrn-NHxEifpnsU0s",
+  "program_id": "emtcTT4vEAECAwQFBgcICaCxwtPk9QYXKDlKW2x9jp8",
   "program_registry_topic_id": "0.0.600003",
   "effective_from": "2026-07-01T00:00:00Z",
   "m": "forbidden-token policy, PII v3"
@@ -2037,11 +2112,13 @@ The issuer (`0.0.500100`) publishes the PII policy the receipt above cites
    0.0.600003`.
 2. Read the `receipt_issued` message of Example 1 from topic `0.0.600001`.
 3. Recompute `statement_hash` from the inline journal —
-   `GqN3J7ZcmJ5DHMHZlKVG3clUIp9SSgT0JWRbMM_cUHk` — it matches.
-4. Resolve `vk_id 761BxFWR…` on topic `0.0.600003`: the `program_registered`
-   entry binds it to `program_id ibCgW52c…` and `stark_v1`, matching the
-   journal; fetch the verifying key from `vk_ref` and check
-   `commit(nfc("vk"), vk_bytes)` equals `vk_id`.
+   `3G4E9re7hfevvMcL0ua9mVvjBiLbrLq72kuryUTpAF0` — it matches.
+4. Resolve `program_id emtcTT4v…` on topic `0.0.600003`: the
+   `program_registered` entry binds it to `stark_v1`, matching the journal,
+   and carries no `vk_id`, so the receipt's `proof` MUST carry none either.
+   (For a proof system with verifier-key material the auditor would also fetch
+   the key from `vk_ref` and check `commit(nfc("vk"), vk_bytes)` equals
+   `vk_id`.)
 5. Resolve `policy_id acme.pii.v3` on topic `0.0.600002`: the
    `policy_published` entry of Example 2 is in effect at the receipt's
    consensus timestamp and its commitments match the journal.
@@ -2120,10 +2197,9 @@ Article 78) and takes place outside the ZKBC evidence path.
 8. RFC 3986 — Uniform Resource Identifier (URI): Generic Syntax; case normalization of web request targets, §6.2.2.1.
 9. Unicode Standard Annex #15 — Unicode Normalization Forms (NFC, NFKC); The Unicode Standard, §3.13 and §5.18 — default case folding.
 10. Unicode Standard Annex #29 — Unicode Text Segmentation.
-11. RFC 6962 — Certificate Transparency; Merkle leaf/node domain separation, §2.1.
-12. HCS-1 — File Data Management; storage and integrity of receipts and verifying keys.
-13. HCS-2 — Topic Registries; `indexed`/`ttl` memo semantics.
-14. HCS-11 — Profile Metadata; advertisement of ZKBC topic IDs.
+11. HCS-1 — File Data Management; storage and integrity of receipts and verifying keys.
+12. HCS-2 — Topic Registries; `indexed`/`ttl` memo semantics.
+13. HCS-11 — Profile Metadata; advertisement of ZKBC topic IDs.
 
 ### Informative References
 
@@ -2136,12 +2212,12 @@ Article 78) and takes place outside the ZKBC evidence path.
 7. Goldwasser, S., Micali, S., Rackoff, C. — "The Knowledge Complexity of Interactive Proof Systems." SIAM Journal on Computing 18(1), 1989. Zero-knowledge proofs.
 8. Bellare, M., Goldreich, O. — "On Defining Proofs of Knowledge." CRYPTO 1992. Knowledge soundness.
 9. Fiat, A., Shamir, A. — "How to Prove Yourself: Practical Solutions to Identification and Signature Problems." CRYPTO 1986. Non-interactivity from public-coin protocols in the random-oracle model.
-10. Merkle, R. — "A Digital Signature Based on a Conventional Encryption Function." CRYPTO 1987. Hash-tree set commitments.
-11. Ben-Sasson, E., Chiesa, A., Tromer, E., Virza, M. — "Succinct Non-Interactive Zero Knowledge for a von Neumann Architecture." USENIX Security 2014. General-purpose zero-knowledge virtual machines.
-12. Ben-Sasson, E., Bentov, I., Horesh, Y., Riabzev, M. — "Scalable, transparent, and post-quantum secure computational integrity." IACR ePrint 2018/046. Transparent, hash-based succinct arguments.
-13. Groth, J. — "On the Size of Pairing-Based Non-interactive Arguments." EUROCRYPT 2016. Pairing-based succinct proofs (OPTIONAL, not post-quantum).
-14. NIST IR 8547 (Initial Public Draft, 2024) — Transition to Post-Quantum Cryptography Standards. Post-quantum migration guidance.
-15. Unicode Technical Standard #39 — Unicode Security Mechanisms; confusable-skeleton mapping.
+10. Ben-Sasson, E., Chiesa, A., Tromer, E., Virza, M. — "Succinct Non-Interactive Zero Knowledge for a von Neumann Architecture." USENIX Security 2014. General-purpose zero-knowledge virtual machines.
+11. Ben-Sasson, E., Bentov, I., Horesh, Y., Riabzev, M. — "Scalable, transparent, and post-quantum secure computational integrity." IACR ePrint 2018/046. Transparent, hash-based succinct arguments.
+12. Groth, J. — "On the Size of Pairing-Based Non-interactive Arguments." EUROCRYPT 2016. Pairing-based succinct proofs (OPTIONAL, not post-quantum).
+13. NIST IR 8547 (Initial Public Draft, 2024) — Transition to Post-Quantum Cryptography Standards. Post-quantum migration guidance.
+14. Unicode Technical Standard #39 — Unicode Security Mechanisms; confusable-skeleton mapping.
+15. Grover, L. K. — "A Fast Quantum Mechanical Algorithm for Database Search." STOC 1996; Brassard, G., Høyer, P., Tapp, A. — "Quantum Cryptanalysis of Hash and Claw-Free Functions." LATIN 1998. Quantum bounds on preimage and collision search cited in [Rationale](#rationale).
 16. Regulation (EU) 2024/1689 (Artificial Intelligence Act) — Articles 12, 19, 21, and 78; see [Relationship to Record-Keeping Obligations](#relationship-to-record-keeping-obligations).
 
 ## Conclusion
